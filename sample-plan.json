@@ -1,0 +1,20 @@
+{
+  "requirement": { "id": "r1", "name": "Platform v2 Release", "hardEndDate": "2026-11-23" },
+  "teams": [
+    { "id": "t1", "name": "Backend",  "color": "#4F86C6" },
+    { "id": "t2", "name": "Frontend", "color": "#56AB91" },
+    { "id": "t3", "name": "Data",     "color": "#C98E3A" }
+  ],
+  "tickets": [
+    { "id": "tk1", "name": "API Auth",     "teamId": "t1", "startDate": "2026-09-01", "endDate": "2026-09-19", "dependsOn": [] },
+    { "id": "tk2", "name": "API Search",   "teamId": "t1", "startDate": "2026-09-19", "endDate": "2026-10-03", "dependsOn": ["tk1"] },
+    { "id": "tk3", "name": "UI Login",     "teamId": "t2", "startDate": "2026-09-19", "endDate": "2026-10-07", "dependsOn": ["tk1"] },
+    { "id": "tk4", "name": "UI Search",    "teamId": "t2", "startDate": "2026-10-07", "endDate": "2026-10-21", "dependsOn": ["tk2", "tk3"] },
+    { "id": "tk5", "name": "ETL Pipeline", "teamId": "t3", "startDate": "2026-09-01", "endDate": "2026-10-07", "dependsOn": [] },
+    { "id": "tk6", "name": "Dashboard",    "teamId": "t3", "startDate": "2026-10-21", "endDate": "2026-11-04", "dependsOn": ["tk4", "tk5"] },
+    { "id": "tk7", "name": "Integration",  "teamId": "t1", "startDate": "2026-11-04", "endDate": "2026-11-18", "dependsOn": ["tk6"] },
+    { "id": "tk8", "name": "UAT",          "teamId": "t2", "startDate": "2026-11-18", "endDate": "2026-11-23", "dependsOn": ["tk7"] }
+  ],
+  "sim": { "deltas": {} },
+  "activeView": "gantt"
+}
