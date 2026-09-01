@@ -1,0 +1,1525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Delivery Risk Visualizer</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .ticket-bar { cursor: ew-resize; transition: opacity 0.1s; }
+    .ticket-bar:hover rect { filter: brightness(1.1); }
+    .ticket-bar.dragging rect { opacity: 0.65; stroke-dasharray: 4 2; stroke: rgba(0,0,0,0.4); stroke-width: 1.5; }
+    .dep-arrow { pointer-events: none; }
+    .gantt-scroll { overflow-x: auto; overflow-y: auto; min-height: 0; flex-shrink: 0; }
+    input[type="date"] { color-scheme: light; }
+    select option:checked { background: #3B82F6; color: white; }
+
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #f1f1f1; }
+    ::-webkit-scrollbar-thumb { background: #c1c1c1; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-gray-50">
+  <div id="root"></div>
+
+<script type="text/babel" data-v="2">
+const { useState, useReducer, useRef, useEffect, useContext, createContext, useCallback } = React;
+
+// ============================================================
+// === SECTION: SamplePlan ===
+// ============================================================
+// Dates chosen so the baseline forward-pass resolves exactly to the hard end date.
+// Chain: tk1(18d) → tk2(14d) || tk3(18d) → tk4(14d) → tk6(14d) → tk7(14d) → tk8(10d) = Mar 31
+// tk5(39d) runs in parallel and finishes before tk6 starts.
+const SAMPLE_PLAN = {
+  requirement: { id: 'r1', name: 'Platform v2 Release', hardEndDate: '2026-11-23' },
+  teams: [
+    { id: 't1', name: 'Backend',  color: '#4F86C6' },
+    { id: 't2', name: 'Frontend', color: '#56AB91' },
+    { id: 't3', name: 'Data',     color: '#C98E3A' },
+  ],
+  tickets: [
+    // tk1: Sep 1 → Sep 19 (18d). No deps.
+    { id: 'tk1', name: 'API Auth',     teamId: 't1', startDate: '2026-09-01', endDate: '2026-09-19', dependsOn: [] },
+    // tk2: Sep 19 → Oct 3 (14d). Depends on tk1.
+    { id: 'tk2', name: 'API Search',   teamId: 't1', startDate: '2026-09-19', endDate: '2026-10-03', dependsOn: ['tk1'] },
+    // tk3: Sep 19 → Oct 7 (18d). Depends on tk1.
+    { id: 'tk3', name: 'UI Login',     teamId: 't2', startDate: '2026-09-19', endDate: '2026-10-07', dependsOn: ['tk1'] },
+    // tk4: Oct 7 → Oct 21 (14d). Depends on tk2 & tk3. Constrained by tk3 (Oct 7).
+    { id: 'tk4', name: 'UI Search',    teamId: 't2', startDate: '2026-10-07', endDate: '2026-10-21', dependsOn: ['tk2', 'tk3'] },
+    // tk5: Sep 1 → Oct 7 (36d). No deps. Finishes same day tk4 starts — ok.
+    { id: 'tk5', name: 'ETL Pipeline', teamId: 't3', startDate: '2026-09-01', endDate: '2026-10-07', dependsOn: [] },
+    // tk6: Oct 21 → Nov 4 (14d). Depends on tk4 & tk5. Constrained by tk4 (Oct 21).
+    { id: 'tk6', name: 'Dashboard',    teamId: 't3', startDate: '2026-10-21', endDate: '2026-11-04', dependsOn: ['tk4', 'tk5'] },
+    // tk7: Nov 4 → Nov 18 (14d). Depends on tk6.
+    { id: 'tk7', name: 'Integration',  teamId: 't1', startDate: '2026-11-04', endDate: '2026-11-18', dependsOn: ['tk6'] },
+    // tk8: Nov 18 → Nov 23 (5d). Depends on tk7. Ends exactly on deadline.
+    { id: 'tk8', name: 'UAT',          teamId: 't2', startDate: '2026-11-18', endDate: '2026-11-23', dependsOn: ['tk7'] },
+  ],
+  sim: { deltas: {} },
+  activeView: 'gantt',
+};
+
+// ============================================================
+// === SECTION: Constants ===
+// ============================================================
+const LANE_HEIGHT   = 64;
+const BAR_HEIGHT    = 30;
+const AXIS_HEIGHT   = 44;
+const LABEL_WIDTH   = 140;
+const CHART_PADDING = 12; // extra days left+right
+const MS_PER_DAY    = 86400000;
+
+const TEAM_COLORS = [
+  '#4F86C6', '#56AB91', '#C98E3A', '#9B59B6',
+  '#E67E73', '#2ECC71', '#F39C12', '#1ABC9C', '#E74C3C', '#3498DB'
+];
+
+// ============================================================
+// === SECTION: dateUtils ===
+// ============================================================
+function parseDate(str) {
+  // Parse YYYY-MM-DD in local time (avoid UTC shift)
+  const [y, m, d] = str.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function formatDate(ms) {
+  // Use local date parts to avoid UTC timezone shift
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// Normalize a date string by round-tripping through local parseDate
+// to eliminate any sub-day ms drift from arithmetic
+function normDateMs(ms) {
+  const d = new Date(ms);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+function addDays(dateStr, days) {
+  const ms = parseDate(dateStr).getTime() + days * MS_PER_DAY;
+  return formatDate(ms);
+}
+
+function diffDays(dateStrA, dateStrB) {
+  return Math.round((parseDate(dateStrB).getTime() - parseDate(dateStrA).getTime()) / MS_PER_DAY);
+}
+
+function computeChartRange(tickets, effDates, hardEndDate, padding) {
+  let minMs = parseDate(hardEndDate).getTime();
+  let maxMs = parseDate(hardEndDate).getTime();
+  tickets.forEach(t => {
+    const e = effDates[t.id];
+    if (!e) return;
+    if (e.start < minMs) minMs = e.start;
+    if (e.end > maxMs) maxMs = e.end;
+  });
+  // Also consider baseline dates in case no effDates yet
+  tickets.forEach(t => {
+    const s = parseDate(t.startDate).getTime();
+    const e = parseDate(t.endDate).getTime();
+    if (s < minMs) minMs = s;
+    if (e > maxMs) maxMs = e;
+  });
+  return {
+    minMs: minMs - padding * MS_PER_DAY,
+    maxMs: maxMs + padding * MS_PER_DAY,
+  };
+}
+
+function dateToX(dateMs, chartMinMs, pixelsPerDay) {
+  return LABEL_WIDTH + ((dateMs - chartMinMs) / MS_PER_DAY) * pixelsPerDay;
+}
+
+function xToDateMs(x, chartMinMs, pixelsPerDay) {
+  return chartMinMs + ((x - LABEL_WIDTH) / pixelsPerDay) * MS_PER_DAY;
+}
+
+function getMonthTicks(minMs, maxMs) {
+  const ticks = [];
+  const start = new Date(minMs);
+  let d = new Date(start.getFullYear(), start.getMonth(), 1);
+  while (d.getTime() <= maxMs) {
+    ticks.push({ ms: d.getTime(), label: d.toLocaleString('default', { month: 'short', year: '2-digit' }) });
+    d = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+  }
+  return ticks;
+}
+
+function getWeekTicks(minMs, maxMs) {
+  const ticks = [];
+  // Find first Sunday after minMs
+  const start = new Date(minMs);
+  const dow = start.getDay();
+  let d = new Date(minMs + (7 - dow) % 7 * MS_PER_DAY);
+  d = new Date(d.getFullYear(), d.getMonth(), d.getDate()); // normalize to midnight
+  while (d.getTime() <= maxMs) {
+    ticks.push(d.getTime());
+    d = new Date(d.getTime() + 7 * MS_PER_DAY);
+  }
+  return ticks;
+}
+
+// ============================================================
+// === SECTION: cascade (computeEffectiveDates) ===
+// ============================================================
+function computeEffectiveDates(tickets, deltas) {
+  const byId = {};
+  tickets.forEach(t => { byId[t.id] = t; });
+
+  // Topological sort (Kahn's)
+  const inDegree = {};
+  const successors = {};
+  tickets.forEach(t => {
+    inDegree[t.id] = 0;
+    successors[t.id] = [];
+  });
+  tickets.forEach(t => {
+    normDeps(t.dependsOn).forEach(({ id: depId }) => {
+      if (byId[depId]) {
+        inDegree[t.id]++;
+        successors[depId].push(t.id);
+      }
+    });
+  });
+
+  const queue = tickets.filter(t => inDegree[t.id] === 0).map(t => t.id);
+  const order = [];
+  while (queue.length > 0) {
+    const id = queue.shift();
+    order.push(id);
+    successors[id].forEach(sid => {
+      inDegree[sid]--;
+      if (inDegree[sid] === 0) queue.push(sid);
+    });
+  }
+
+  if (order.length < tickets.length) {
+    // Cycle detected — return a best-effort result
+    const remaining = tickets.filter(t => !order.includes(t.id));
+    remaining.forEach(t => order.push(t.id));
+    return { effDates: computeForwardPass(tickets, deltas, byId, order), hasCycle: true, cycleIds: remaining.map(t => t.id) };
+  }
+
+  return { effDates: computeForwardPass(tickets, deltas, byId, order), hasCycle: false, cycleIds: [] };
+}
+
+// Normalize a dependsOn entry — supports both legacy string IDs and {id, type} objects.
+// type 'start' = dep must finish before this ticket starts (blocks start)
+// type 'finish' = dep must finish before this ticket finishes, but start is free (blocks finish)
+function normDep(d) {
+  return typeof d === 'string' ? { id: d, type: 'start' } : d;
+}
+function normDeps(dependsOn) {
+  return (dependsOn || []).map(normDep);
+}
+
+function computeForwardPass(tickets, deltas, byId, order) {
+  const effDates = {};
+  order.forEach(id => {
+    const t = byId[id];
+    if (!t) return;
+    const baseStart = parseDate(t.startDate).getTime();
+    const baseEnd   = t.endDate ? parseDate(t.endDate).getTime() : baseStart;
+    const duration  = Math.max(0, baseEnd - baseStart);
+    const directShift = (deltas[id] ?? 0) * MS_PER_DAY;
+    let constrainedStart = baseStart + directShift;
+
+    // 'start' deps push the start date
+    normDeps(t.dependsOn).forEach(({ id: depId, type }) => {
+      if (type === 'start' && effDates[depId]) {
+        constrainedStart = Math.max(constrainedStart, effDates[depId].end);
+      }
+    });
+
+    let constrainedEnd = constrainedStart + duration;
+
+    // 'finish' deps push only the end date (start is free)
+    normDeps(t.dependsOn).forEach(({ id: depId, type }) => {
+      if (type === 'finish' && effDates[depId]) {
+        constrainedEnd = Math.max(constrainedEnd, effDates[depId].end);
+      }
+    });
+
+    effDates[id] = { start: constrainedStart, end: constrainedEnd };
+  });
+  return effDates;
+}
+
+// ============================================================
+// ============================================================
+// === SECTION: criticalPath ===
+// ============================================================
+function computeCriticalPath(tickets, effDates, hardEndDate) {
+  const hardEndMs = parseDate(hardEndDate).getTime();
+  const byId = {};
+  tickets.forEach(t => { byId[t.id] = t; });
+
+  const successors = {};
+  tickets.forEach(t => { successors[t.id] = []; });
+  tickets.forEach(t => {
+    normDeps(t.dependsOn).forEach(({ id: depId }) => {
+      if (byId[depId]) successors[depId].push(t.id);
+    });
+  });
+
+  const inDegree = {};
+  tickets.forEach(t => { inDegree[t.id] = 0; });
+  tickets.forEach(t => {
+    normDeps(t.dependsOn).forEach(({ id: depId }) => { if (byId[depId]) inDegree[t.id]++; });
+  });
+  const queue = tickets.filter(t => inDegree[t.id] === 0).map(t => t.id);
+  const order = [];
+  while (queue.length > 0) {
+    const id = queue.shift();
+    order.push(id);
+    successors[id].forEach(sid => { inDegree[sid]--; if (inDegree[sid] === 0) queue.push(sid); });
+  }
+
+  const lateFinish = {};
+  tickets.forEach(t => { if (successors[t.id].length === 0) lateFinish[t.id] = hardEndMs; });
+
+  for (let i = order.length - 1; i >= 0; i--) {
+    const id = order[i];
+    const t = byId[id];
+    if (!t || !effDates[id]) continue;
+    const eff = effDates[id];
+    const lf = lateFinish[id] ?? hardEndMs;
+    const ls = lf - (eff.end - eff.start);
+    normDeps(t.dependsOn).forEach(({ id: depId }) => {
+      if (effDates[depId]) {
+        if (lateFinish[depId] === undefined || ls < lateFinish[depId]) lateFinish[depId] = ls;
+      }
+    });
+  }
+
+  const criticalIds = new Set();
+  tickets.forEach(t => {
+    if (!effDates[t.id]) return;
+    const totalFloat = (lateFinish[t.id] ?? hardEndMs) - effDates[t.id].end;
+    if (totalFloat <= 0) criticalIds.add(t.id);
+  });
+
+  const criticalEdges = new Set();
+  tickets.forEach(t => {
+    if (!criticalIds.has(t.id)) return;
+    normDeps(t.dependsOn).forEach(({ id: depId, type }) => {
+      if (criticalIds.has(depId) && effDates[depId] && effDates[t.id]) {
+        const contiguous = type === 'start'
+          ? Math.abs(effDates[depId].end - effDates[t.id].start) < 60000
+          : Math.abs(effDates[depId].end - effDates[t.id].end) < 60000;
+        if (contiguous) criticalEdges.add(`${depId}->${t.id}`);
+      }
+    });
+  });
+
+  return { criticalIds, criticalEdges };
+}
+
+// ============================================================
+// === SECTION: appReducer ===
+// ============================================================
+let _idCounter = Date.now();
+function genId() { return String(++_idCounter); }
+
+const DEFAULT_STATE = {
+  requirement: { id: 'r1', name: '', hardEndDate: '' },
+  teams: [],
+  tickets: [],
+  sim: { deltas: {} },
+  activeView: 'setup',
+};
+
+function appReducer(state, action) {
+  switch (action.type) {
+    case 'SET_REQUIREMENT':
+      return { ...state, requirement: { ...state.requirement, ...action.payload } };
+
+    case 'ADD_TEAM': {
+      const color = TEAM_COLORS[state.teams.length % TEAM_COLORS.length];
+      return { ...state, teams: [...state.teams, { id: genId(), name: action.payload.name, color }] };
+    }
+    case 'UPDATE_TEAM':
+      return { ...state, teams: state.teams.map(t => t.id === action.payload.id ? { ...t, ...action.payload } : t) };
+    case 'DELETE_TEAM': {
+      const teamId = action.payload.id;
+      const deletedTicketIds = state.tickets.filter(t => t.teamId === teamId).map(t => t.id);
+      const newTickets = state.tickets
+        .filter(t => t.teamId !== teamId)
+        .map(t => ({ ...t, dependsOn: normDeps(t.dependsOn).filter(d => !deletedTicketIds.includes(d.id)) }));
+      const newDeltas = { ...state.sim.deltas };
+      deletedTicketIds.forEach(id => delete newDeltas[id]);
+      return { ...state, teams: state.teams.filter(t => t.id !== teamId), tickets: newTickets, sim: { ...state.sim, deltas: newDeltas } };
+    }
+
+    case 'ADD_TICKET': {
+      const t = { id: genId(), name: '', teamId: state.teams[0]?.id || '', startDate: '', endDate: '', dependsOn: [], ...action.payload };
+      return { ...state, tickets: [...state.tickets, t] };
+    }
+    case 'UPDATE_TICKET':
+      return { ...state, tickets: state.tickets.map(t => t.id === action.payload.id ? { ...t, ...action.payload } : t) };
+    case 'DELETE_TICKET': {
+      const ticketId = action.payload.id;
+      const newDeltas = { ...state.sim.deltas };
+      delete newDeltas[ticketId];
+      return {
+        ...state,
+        tickets: state.tickets
+          .filter(t => t.id !== ticketId)
+          .map(t => ({ ...t, dependsOn: normDeps(t.dependsOn).filter(d => d.id !== ticketId) })),
+        sim: { ...state.sim, deltas: newDeltas },
+      };
+    }
+
+    case 'SET_DELTA': {
+      const newDeltas = { ...state.sim.deltas };
+      if (action.payload.delta === 0) delete newDeltas[action.payload.ticketId];
+      else newDeltas[action.payload.ticketId] = action.payload.delta;
+      return { ...state, sim: { ...state.sim, deltas: newDeltas } };
+    }
+    case 'RESET_SIM':
+      return { ...state, sim: { deltas: {} } };
+    case 'LOAD_STATE':
+      return { ...DEFAULT_STATE, ...action.payload };
+    case 'SET_VIEW':
+      return { ...state, activeView: action.payload };
+
+    default:
+      return state;
+  }
+}
+
+// ============================================================
+// === SECTION: GanttContext ===
+// ============================================================
+const GanttCtx = createContext(null);
+
+// ============================================================
+// === SECTION: SetupPanel ===
+// ============================================================
+function SetupPanel({ state, dispatch }) {
+  const { requirement, teams, tickets } = state;
+  const [newTeamName, setNewTeamName] = useState('');
+  const [newTicket, setNewTicket] = useState({ name: '', teamIds: [], startDate: '', endDate: '', dependsOn: [] });
+  const [editingTicketId, setEditingTicketId] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const validTickets = tickets.filter(t => t.startDate && t.name);
+
+  function handleAddTeam() {
+    if (!newTeamName.trim()) return;
+    dispatch({ type: 'ADD_TEAM', payload: { name: newTeamName.trim() } });
+    setNewTeamName('');
+  }
+
+  function handleAddTicket() {
+    if (!newTicket.name || newTicket.teamIds.length === 0 || !newTicket.startDate) return;
+    const multiTeam = newTicket.teamIds.length > 1;
+    newTicket.teamIds.forEach(teamId => {
+      const team = teams.find(t => t.id === teamId);
+      const name = multiTeam ? `${newTicket.name} (${team?.name || teamId})` : newTicket.name;
+      dispatch({ type: 'ADD_TICKET', payload: { ...newTicket, name, teamId, teamIds: undefined } });
+    });
+    setNewTicket({ name: '', teamIds: newTicket.teamIds, startDate: newTicket.endDate || newTicket.startDate, endDate: '', dependsOn: [] });
+  }
+
+  function handleSaveJson() {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${requirement.name || 'plan'}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function handleLoadJson(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const loaded = JSON.parse(ev.target.result);
+        dispatch({ type: 'LOAD_STATE', payload: loaded });
+      } catch (err) {
+        alert('Invalid JSON file.');
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  }
+
+  const teamById = {};
+  teams.forEach(t => { teamById[t.id] = t; });
+
+  return (
+    <div className="bg-white border-r border-gray-200 flex flex-col h-full overflow-y-auto overflow-x-hidden w-full">
+      {/* Header */}
+      <div className="px-4 py-3 border-b border-gray-200 bg-gray-50 flex items-center justify-between">
+        <h1 className="text-sm font-semibold text-gray-800 tracking-wide uppercase">Delivery Risk Visualizer</h1>
+        <button
+          onClick={() => dispatch({ type: 'SET_VIEW', payload: 'gantt' })}
+          disabled={validTickets.length === 0 || !requirement.hardEndDate || !requirement.name}
+          className="text-xs bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          View Gantt →
+        </button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-4 space-y-6">
+        {/* Requirement */}
+        <section>
+          <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Requirement</h2>
+          <input
+            className="w-full border border-gray-300 rounded px-2 py-1.5 text-sm mb-2 focus:outline-none focus:ring-1 focus:ring-blue-400"
+            placeholder="Requirement name"
+            value={requirement.name}
+            onChange={e => dispatch({ type: 'SET_REQUIREMENT', payload: { name: e.target.value } })}
+          />
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-gray-500 whitespace-nowrap">Hard deadline</label>
+            <input
+              type="date"
+              className="flex-1 border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400"
+              value={requirement.hardEndDate}
+              onChange={e => dispatch({ type: 'SET_REQUIREMENT', payload: { hardEndDate: e.target.value } })}
+            />
+          </div>
+        </section>
+
+        {/* Teams */}
+        <section>
+          <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Teams</h2>
+          <div className="space-y-1 mb-2">
+            {teams.map(team => (
+              <div key={team.id} className="flex items-center gap-2 group">
+                <span style={{ background: team.color }} className="w-3 h-3 rounded-full flex-shrink-0" />
+                <input
+                  className="flex-1 text-sm border border-transparent rounded px-1.5 py-0.5 hover:border-gray-300 focus:border-blue-400 focus:outline-none"
+                  value={team.name}
+                  onChange={e => dispatch({ type: 'UPDATE_TEAM', payload: { id: team.id, name: e.target.value } })}
+                />
+                <button
+                  onClick={() => dispatch({ type: 'DELETE_TEAM', payload: { id: team.id } })}
+                  className="text-gray-300 hover:text-red-400 text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+                >✕</button>
+              </div>
+            ))}
+          </div>
+          <div className="flex gap-1">
+            <input
+              className="flex-1 border border-gray-300 rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400"
+              placeholder="New team name"
+              value={newTeamName}
+              onChange={e => setNewTeamName(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleAddTeam()}
+            />
+            <button onClick={handleAddTeam} className="text-sm bg-gray-100 hover:bg-gray-200 px-2 py-1 rounded border border-gray-300">+ Add</button>
+          </div>
+        </section>
+
+        {/* Tickets */}
+        <section>
+          <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Tickets</h2>
+          {tickets.length === 0 && <p className="text-xs text-gray-400 mb-2">No tickets yet. Add teams first.</p>}
+          <div className="space-y-1 mb-3">
+            {tickets.map(ticket => {
+              const team = teamById[ticket.teamId];
+              const isEditing = editingTicketId === ticket.id;
+              return (
+                <div key={ticket.id} className="group">
+                  {!isEditing ? (
+                    <div
+                      className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-gray-50 cursor-pointer"
+                      onClick={() => setEditingTicketId(ticket.id)}
+                    >
+                      <span style={{ background: team?.color || '#ccc' }} className="w-2.5 h-2.5 rounded-sm flex-shrink-0" />
+                      <span className="text-sm flex-1 truncate">{ticket.name || <span className="text-gray-400 italic">untitled</span>}</span>
+                      <span className="text-xs text-gray-400">{ticket.startDate} – {ticket.endDate}</span>
+                      <button
+                        onClick={e => { e.stopPropagation(); dispatch({ type: 'DELETE_TICKET', payload: { id: ticket.id } }); }}
+                        className="text-gray-300 hover:text-red-400 text-xs opacity-0 group-hover:opacity-100"
+                      >✕</button>
+                    </div>
+                  ) : (
+                    <TicketEditForm
+                      ticket={ticket}
+                      teams={teams}
+                      tickets={tickets}
+                      onSave={({ teamIds, ...updates }) => {
+                        const multiTeam = teamIds.length > 1;
+                        const baseName = updates.name;
+                        // Update existing ticket — keep its original teamId, rename if multi
+                        const existingTeamId = ticket.teamId;
+                        const existingName = multiTeam ? `${baseName} (${teams.find(t => t.id === existingTeamId)?.name || existingTeamId})` : baseName;
+                        dispatch({ type: 'UPDATE_TICKET', payload: { id: ticket.id, ...updates, name: existingName, teamId: existingTeamId } });
+                        // Create new copies for any additional teams
+                        teamIds.filter(tid => tid !== existingTeamId).forEach(tid => {
+                          const tName = multiTeam ? `${baseName} (${teams.find(t => t.id === tid)?.name || tid})` : baseName;
+                          dispatch({ type: 'ADD_TICKET', payload: { ...updates, name: tName, teamId: tid } });
+                        });
+                        setEditingTicketId(null);
+                      }}
+                      onCancel={() => setEditingTicketId(null)}
+                    />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {teams.length > 0 && (
+            <div className="bg-gray-50 rounded border border-dashed border-gray-300 p-3 space-y-2">
+              <p className="text-xs font-medium text-gray-500">Add ticket</p>
+              <input
+                className="w-full border border-gray-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400"
+                placeholder="Ticket name"
+                value={newTicket.name}
+                onChange={e => setNewTicket(p => ({ ...p, name: e.target.value }))}
+              />
+              <div>
+                <label className="text-xs text-gray-400 block mb-0.5">Team(s) — hold Ctrl/Cmd to select multiple</label>
+                <select
+                  multiple
+                  className="w-full border border-gray-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400"
+                  style={{ height: Math.min(teams.length * 26 + 4, 100) }}
+                  value={newTicket.teamIds}
+                  onChange={e => {
+                    const vals = Array.from(e.target.selectedOptions).map(o => o.value);
+                    setNewTicket(p => ({ ...p, teamIds: vals }));
+                  }}
+                >
+                  {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+                </select>
+              </div>
+              <div className="flex gap-1">
+                <div className="flex-1 min-w-0">
+                  <label className="text-xs text-gray-400">Start</label>
+                  <input type="date" className="w-full min-w-0 border border-gray-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400"
+                    value={newTicket.startDate}
+                    onChange={e => setNewTicket(p => ({ ...p, startDate: e.target.value }))} />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <label className="text-xs text-gray-400">End (optional)</label>
+                  <input type="date" className="w-full min-w-0 border border-gray-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400"
+                    value={newTicket.endDate}
+                    onChange={e => setNewTicket(p => ({ ...p, endDate: e.target.value }))} />
+                </div>
+              </div>
+              {tickets.length > 0 && (
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">Dependencies (optional)</label>
+                  <DepsEditor
+                    deps={newTicket.dependsOn}
+                    allTickets={tickets}
+                    onChange={deps => setNewTicket(p => ({ ...p, dependsOn: deps }))}
+                  />
+                </div>
+              )}
+
+              <button
+                onClick={handleAddTicket}
+                disabled={!newTicket.name || newTicket.teamIds.length === 0 || !newTicket.startDate}
+                className="w-full text-sm bg-blue-600 text-white py-1.5 rounded hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
+              >Add Ticket</button>
+            </div>
+          )}
+        </section>
+
+        {/* Actions */}
+        <section>
+          <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Plan</h2>
+          <div className="flex gap-2">
+            <button onClick={handleSaveJson} className="flex-1 text-xs border border-gray-300 rounded py-1.5 hover:bg-gray-50">↓ Save JSON</button>
+            <button onClick={() => fileInputRef.current?.click()} className="flex-1 text-xs border border-gray-300 rounded py-1.5 hover:bg-gray-50">↑ Load JSON</button>
+            <input ref={fileInputRef} type="file" accept=".json" className="hidden" onChange={handleLoadJson} />
+          </div>
+          <button
+            onClick={() => {
+              if (window.confirm('Reset everything to a blank state? This cannot be undone.')) {
+                localStorage.removeItem('drv_appstate_v1');
+                dispatch({ type: 'LOAD_STATE', payload: DEFAULT_STATE });
+              }
+            }}
+            className="w-full mt-2 text-xs border border-gray-300 text-gray-500 rounded py-1.5 hover:bg-red-50 hover:border-red-200 hover:text-red-500"
+          >↺ Reset to Blank</button>
+          {Object.keys(state.sim.deltas).length > 0 && (
+            <button
+              onClick={() => dispatch({ type: 'RESET_SIM' })}
+              className="w-full mt-2 text-xs border border-red-200 text-red-500 rounded py-1.5 hover:bg-red-50"
+            >Reset Simulation</button>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+// DepsEditor — per-row dependency picker with type selector
+function DepsEditor({ deps, allTickets, onChange }) {
+  const normalized = normDeps(deps);
+  const usedIds = new Set(normalized.map(d => d.id));
+  const available = allTickets.filter(t => !usedIds.has(t.id));
+
+  function addDep(ticketId) {
+    if (!ticketId) return;
+    onChange([...normalized, { id: ticketId, type: 'start' }]);
+  }
+  function removeDep(id) {
+    onChange(normalized.filter(d => d.id !== id));
+  }
+  function toggleType(id) {
+    onChange(normalized.map(d => d.id === id ? { ...d, type: d.type === 'start' ? 'finish' : 'start' } : d));
+  }
+
+  const ticketById = {};
+  allTickets.forEach(t => { ticketById[t.id] = t; });
+
+  return (
+    <div className="space-y-1">
+      {normalized.map(d => {
+        const t = ticketById[d.id];
+        if (!t) return null;
+        return (
+          <div key={d.id} className="flex items-center gap-1 text-xs">
+            <span className="flex-1 truncate text-gray-700" title={t.name}>{t.name}</span>
+            <button
+              onClick={() => toggleType(d.id)}
+              title={d.type === 'start' ? 'Blocks start — click to change to blocks finish' : 'Blocks finish — click to change to blocks start'}
+              className={`px-1.5 py-0.5 rounded border text-xs font-medium whitespace-nowrap ${
+                d.type === 'start'
+                  ? 'bg-orange-50 border-orange-200 text-orange-700'
+                  : 'bg-blue-50 border-blue-200 text-blue-700'
+              }`}
+            >
+              {d.type === 'start' ? 'blocks start' : 'blocks finish'}
+            </button>
+            <button onClick={() => removeDep(d.id)} className="text-gray-300 hover:text-red-400 px-1">✕</button>
+          </div>
+        );
+      })}
+      {available.length > 0 && (
+        <select
+          className="w-full border border-gray-300 rounded px-2 py-1 text-sm text-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-400"
+          value=""
+          onChange={e => addDep(e.target.value)}
+        >
+          <option value="">+ Add dependency…</option>
+          {available.map(t => <option key={t.id} value={t.id}>{t.name || 'untitled'}</option>)}
+        </select>
+      )}
+    </div>
+  );
+}
+
+function TicketEditForm({ ticket, teams, tickets, onSave, onCancel }) {
+  const [form, setForm] = useState({
+    name: ticket.name,
+    teamIds: [ticket.teamId],
+    startDate: ticket.startDate,
+    endDate: ticket.endDate,
+    dependsOn: ticket.dependsOn || [],
+  });
+  const otherTickets = tickets.filter(t => t.id !== ticket.id);
+  const teamById = {};
+  teams.forEach(t => { teamById[t.id] = t; });
+
+  return (
+    <div className="bg-blue-50 border border-blue-200 rounded p-3 space-y-2">
+      <input
+        className="w-full border border-gray-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400"
+        value={form.name}
+        onChange={e => setForm(p => ({ ...p, name: e.target.value }))}
+        placeholder="Ticket name"
+      />
+      <div>
+        <label className="text-xs text-gray-400 block mb-0.5">Team(s) — hold Ctrl/Cmd to select multiple</label>
+        <select
+          multiple
+          className="w-full border border-gray-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-400"
+          style={{ height: Math.min(teams.length * 26 + 4, 100) }}
+          value={form.teamIds}
+          onChange={e => setForm(p => ({ ...p, teamIds: Array.from(e.target.selectedOptions).map(o => o.value) }))}
+        >
+          {teams.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+        </select>
+      </div>
+      <div className="flex gap-1">
+        <div className="flex-1 min-w-0">
+          <label className="text-xs text-gray-400">Start</label>
+          <input type="date" className="w-full min-w-0 border border-gray-300 rounded px-2 py-1 text-sm"
+            value={form.startDate} onChange={e => setForm(p => ({ ...p, startDate: e.target.value }))} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <label className="text-xs text-gray-400">End</label>
+          <input type="date" className="w-full min-w-0 border border-gray-300 rounded px-2 py-1 text-sm"
+            value={form.endDate} onChange={e => setForm(p => ({ ...p, endDate: e.target.value }))} />
+        </div>
+      </div>
+      {otherTickets.length > 0 && (
+        <div>
+          <label className="text-xs text-gray-400 block mb-1">Dependencies (optional)</label>
+          <DepsEditor
+            deps={form.dependsOn}
+            allTickets={otherTickets}
+            onChange={deps => setForm(p => ({ ...p, dependsOn: deps }))}
+          />
+        </div>
+      )}
+      <div className="flex gap-2">
+        <button onClick={() => onSave(form)} disabled={form.teamIds.length === 0} className="flex-1 text-xs bg-blue-600 text-white py-1 rounded hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed">Save</button>
+        <button onClick={onCancel} className="flex-1 text-xs border border-gray-300 py-1 rounded hover:bg-gray-50">Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// === SECTION: DateAxis ===
+// ============================================================
+function DateAxis({ chartMinMs, chartMaxMs, pixelsPerDay, svgWidth }) {
+  const monthTicks = getMonthTicks(chartMinMs, chartMaxMs);
+  const weekTicks = getWeekTicks(chartMinMs, chartMaxMs);
+
+  return (
+    <g>
+      {/* Axis background */}
+      <rect x={0} y={0} width={svgWidth} height={AXIS_HEIGHT} fill="#F8FAFC" />
+      <line x1={0} y1={AXIS_HEIGHT} x2={svgWidth} y2={AXIS_HEIGHT} stroke="#E2E8F0" strokeWidth={1} />
+
+      {/* Week tick marks */}
+      {weekTicks.map(ms => {
+        const x = dateToX(ms, chartMinMs, pixelsPerDay);
+        return <line key={ms} x1={x} y1={AXIS_HEIGHT - 6} x2={x} y2={AXIS_HEIGHT} stroke="#CBD5E1" strokeWidth={1} />;
+      })}
+
+      {/* Month labels + vertical grid lines */}
+      {monthTicks.map((tick, i) => {
+        const x = dateToX(tick.ms, chartMinMs, pixelsPerDay);
+        const nextMs = monthTicks[i + 1]?.ms || chartMaxMs;
+        const nextX = dateToX(nextMs, chartMinMs, pixelsPerDay);
+        const labelX = Math.max(x, LABEL_WIDTH) + (nextX - Math.max(x, LABEL_WIDTH)) / 2;
+        return (
+          <g key={tick.ms}>
+            <line x1={x} y1={0} x2={x} y2={AXIS_HEIGHT} stroke="#E2E8F0" strokeWidth={1} />
+            {labelX > LABEL_WIDTH && labelX < svgWidth && (
+              <text x={labelX} y={20} textAnchor="middle" fontSize={11} fill="#64748B" fontWeight="500">
+                {tick.label}
+              </text>
+            )}
+          </g>
+        );
+      })}
+
+      {/* Label column separator */}
+      <line x1={LABEL_WIDTH} y1={0} x2={LABEL_WIDTH} y2={AXIS_HEIGHT} stroke="#E2E8F0" strokeWidth={1} />
+      <rect x={0} y={0} width={LABEL_WIDTH} height={AXIS_HEIGHT} fill="#F8FAFC" />
+      <text x={LABEL_WIDTH / 2} y={24} textAnchor="middle" fontSize={10} fill="#94A3B8" fontStyle="italic">Team</text>
+    </g>
+  );
+}
+
+// ============================================================
+// === SECTION: TicketBar ===
+// ============================================================
+function TicketBar({ ticket, effStart, effEnd, baseStart, baseEnd, laneTop, isCritical, isPastDeadline, isDragging, isDragged, teamColor, dispatch, pixelsPerDay, chartMinMs }) {
+  const x = dateToX(effStart, chartMinMs, pixelsPerDay);
+  const w = Math.max(4, dateToX(effEnd, chartMinMs, pixelsPerDay) - x);
+  const y = laneTop + (LANE_HEIGHT - BAR_HEIGHT) / 2;
+
+  // Ghost bar geometry (baseline position)
+  const hasShifted = isDragged > 0 || effStart > baseStart;
+  const gx = dateToX(baseStart, chartMinMs, pixelsPerDay);
+  const gw = Math.max(4, dateToX(baseEnd, chartMinMs, pixelsPerDay) - gx);
+
+  const dragRef = useRef(null);
+
+  function fill() {
+    if (isCritical && isPastDeadline) return '#B91C1C';
+    if (isCritical) return '#EF4444';
+    if (isPastDeadline) return '#F97316';
+    return teamColor;
+  }
+
+  function handleMouseDown(e) {
+    e.preventDefault();
+    dragRef.current = { ticketId: ticket.id, startMouseX: e.clientX, originalDelta: isDragged || 0 };
+    function onMove(me) {
+      const dx = me.clientX - dragRef.current.startMouseX;
+      const daysDelta = Math.round(dx / pixelsPerDay);
+      const newDelta = Math.max(0, dragRef.current.originalDelta + daysDelta);
+      dispatch({ type: 'SET_DELTA', payload: { ticketId: ticket.id, delta: newDelta } });
+    }
+    function onUp() {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      dragRef.current = null;
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
+  const slipLabel = isDragged ? ` (+${isDragged}d)` : '';
+  const cascadeLabel = (!isDragged && hasShifted) ? ' (cascaded)' : '';
+  const tooltipLines = [
+    ticket.name + slipLabel + cascadeLabel,
+    `Baseline: ${formatDate(baseStart)} → ${formatDate(baseEnd)}`,
+    hasShifted ? `Simulated: ${formatDate(effStart)} → ${formatDate(effEnd)}` : null,
+    isPastDeadline ? '🔴 Past deadline!' : null,
+  ].filter(Boolean).join('\n');
+
+  return (
+    <g style={{ cursor: 'ew-resize' }}>
+      <defs>
+        <clipPath id={`clip-bar-${ticket.id}`}>
+          <rect x={x + 4} y={y} width={Math.max(0, w - 8)} height={BAR_HEIGHT} />
+        </clipPath>
+      </defs>
+
+      {/* Ghost bar — faded baseline, only when shifted */}
+      {hasShifted && (
+        <rect
+          x={gx} y={y + 4} width={gw} height={BAR_HEIGHT - 8}
+          rx={3}
+          fill={teamColor}
+          opacity={0.22}
+          stroke={teamColor}
+          strokeWidth={1}
+          strokeDasharray="3 2"
+          style={{ pointerEvents: 'none' }}
+        />
+      )}
+
+      {/* Live (simulated) bar */}
+      <g
+        className={`ticket-bar${isDragging ? ' dragging' : ''}`}
+        onMouseDown={handleMouseDown}
+      >
+        <rect
+          x={x} y={y} width={w} height={BAR_HEIGHT}
+          rx={4}
+          fill={fill()}
+          stroke={isCritical || isPastDeadline ? 'rgba(0,0,0,0.2)' : 'rgba(0,0,0,0.1)'}
+          strokeWidth={1}
+          opacity={isDragging ? 0.7 : 1}
+        />
+        {w > 20 && (
+          <text
+            x={x + 6} y={y + BAR_HEIGHT / 2 + 4}
+            textAnchor="start"
+            fontSize={w < 80 ? 9 : w < 130 ? 10 : 11}
+            fill="white" fontWeight="500"
+            style={{ pointerEvents: 'none', userSelect: 'none' }}
+            clipPath={`url(#clip-bar-${ticket.id})`}
+          >
+            {ticket.name}{isDragged ? ` +${isDragged}d` : ''}
+          </text>
+        )}
+        <title>{tooltipLines}</title>
+      </g>
+    </g>
+  );
+}
+
+// ============================================================
+// === SECTION: SwimLane ===
+// ============================================================
+
+// Greedy interval packing: assign each ticket to the lowest sub-row where it doesn't overlap.
+// Returns { [ticketId]: subRowIndex }
+function assignSubRows(tickets, effDates) {
+  const result = {};
+  // rowEndMs[r] = the earliest time row r is free again
+  const rowEndMs = [];
+  // Sort by effective start time so earlier tickets get lower rows first
+  const sorted = [...tickets].sort((a, b) => {
+    const ea = effDates[a.id]?.start ?? 0;
+    const eb = effDates[b.id]?.start ?? 0;
+    return ea - eb;
+  });
+  sorted.forEach(ticket => {
+    const eff = effDates[ticket.id];
+    if (!eff) { result[ticket.id] = 0; return; }
+    // Find first row where this ticket fits (no overlap)
+    let row = rowEndMs.findIndex(endMs => endMs <= eff.start);
+    if (row === -1) row = rowEndMs.length;
+    rowEndMs[row] = eff.end;
+    result[ticket.id] = row;
+  });
+  return result;
+}
+
+function SwimLane({ team, isEven, laneTop, laneHeight, tickets, subRows, effDates, criticalIds, hardEndMs, deltas, dispatch, pixelsPerDay, chartMinMs, svgWidth, activeDragId }) {
+  return (
+    <g>
+      {/* Lane background */}
+      <rect x={0} y={laneTop} width={svgWidth} height={laneHeight} fill={isEven ? '#FFFFFF' : '#F8FAFC'} />
+      <line x1={0} y1={laneTop + laneHeight} x2={svgWidth} y2={laneTop + laneHeight} stroke="#EEF2F7" strokeWidth={1} />
+
+      {/* Team label background */}
+      <rect x={0} y={laneTop} width={LABEL_WIDTH} height={laneHeight} fill={isEven ? '#F8FAFC' : '#F1F5F9'} />
+      <line x1={LABEL_WIDTH} y1={laneTop} x2={LABEL_WIDTH} y2={laneTop + laneHeight} stroke="#E2E8F0" strokeWidth={1} />
+
+      {/* Team color badge */}
+      <rect x={8} y={laneTop + (laneHeight - 18) / 2} width={4} height={18} rx={2} fill={team.color} />
+
+      {/* Team name */}
+      <text x={20} y={laneTop + laneHeight / 2 + 4} fontSize={12} fill="#374151" fontWeight="500">
+        {team.name.length > 14 ? team.name.slice(0, 13) + '…' : team.name}
+      </text>
+
+      {/* Sub-row dividers (when multiple rows) */}
+      {laneHeight > LANE_HEIGHT && Array.from({ length: Math.round(laneHeight / LANE_HEIGHT) - 1 }, (_, i) => (
+        <line key={i} x1={LABEL_WIDTH} y1={laneTop + (i + 1) * LANE_HEIGHT} x2={svgWidth} y2={laneTop + (i + 1) * LANE_HEIGHT}
+          stroke="#E8EEF4" strokeWidth={1} strokeDasharray="4 3" />
+      ))}
+
+      {/* Ticket bars */}
+      {tickets.map(ticket => {
+        const eff = effDates[ticket.id];
+        if (!eff || !ticket.startDate || !ticket.endDate) return null;
+        const isCritical = criticalIds.has(ticket.id);
+        const isPastDeadline = eff.end > hardEndMs;
+        const isDragged = deltas[ticket.id];
+        const isDragging = activeDragId === ticket.id;
+        const subRow = subRows[ticket.id] ?? 0;
+        return (
+          <TicketBar
+            key={ticket.id}
+            ticket={ticket}
+            effStart={eff.start}
+            effEnd={eff.end}
+            baseStart={parseDate(ticket.startDate).getTime()}
+            baseEnd={parseDate(ticket.endDate).getTime()}
+            laneTop={laneTop + subRow * LANE_HEIGHT}
+            isCritical={isCritical}
+            isPastDeadline={isPastDeadline}
+            isDragged={isDragged}
+            isDragging={isDragging}
+            teamColor={team.color}
+            dispatch={dispatch}
+            pixelsPerDay={pixelsPerDay}
+            chartMinMs={chartMinMs}
+          />
+        );
+      })}
+    </g>
+  );
+}
+
+// ============================================================
+// === SECTION: DependencyArrows ===
+// ============================================================
+function DependencyArrows({ tickets, effDates, criticalEdges, pixelsPerDay, chartMinMs, ticketBarCenterY }) {
+  if (!tickets || !ticketBarCenterY) return <g/>;
+
+  // Pre-collect all edges so we can fan out multiple arrows from the same source
+  const edgeList = [];
+  tickets.forEach(ticket => {
+    normDeps(ticket.dependsOn || []).forEach(({ id: depId, type }) => {
+      const upstream = tickets.find(t => t.id === depId);
+      if (!upstream) return;
+      const upEff = effDates[depId];
+      const downEff = effDates[ticket.id];
+      if (!upEff || !downEff) return;
+      edgeList.push({ ticket, upstream, depId, type, upEff, downEff });
+    });
+  });
+
+  // Count how many arrows depart from each source bar, and track index per source
+  const srcCount = {};
+  const srcIndex = {};
+  edgeList.forEach(({ depId }) => { srcCount[depId] = (srcCount[depId] || 0) + 1; });
+
+  const arrows = [];
+  edgeList.forEach(({ ticket, upstream, depId, type, upEff, downEff }) => {
+      const srcCenterY = ticketBarCenterY[upstream.id] ?? 0;
+      const dstCenterY = ticketBarCenterY[ticket.id] ?? 0;
+      const BAR_HALF = BAR_HEIGHT / 2;
+
+      const srcX = dateToX(upEff.end, chartMinMs, pixelsPerDay);
+      const dstEndX = dateToX(downEff.end, chartMinMs, pixelsPerDay);
+      const dstStartX = dateToX(downEff.start, chartMinMs, pixelsPerDay);
+
+      // Fan-out: spread departure Y across the bar height when multiple arrows leave same source
+      const count = srcCount[depId] || 1;
+      srcIndex[depId] = (srcIndex[depId] ?? -1) + 1;
+      const idx = srcIndex[depId];
+      const spread = Math.min((BAR_HEIGHT - 8) / Math.max(count, 1), 10);
+      const fanOffset = count > 1 ? (idx - (count - 1) / 2) * spread : 0;
+      const srcY = srcCenterY + fanOffset;
+
+      let dstX, dstY, d;
+
+      if (type === 'finish') {
+        // Finish-to-finish: loop right, land on top/bottom edge of dst bar
+        dstX = dstEndX;
+        dstY = dstCenterY + (srcCenterY <= dstCenterY ? -BAR_HALF : BAR_HALF);
+        const loopX = Math.max(srcX, dstEndX) + 20;
+        d = `M ${srcX} ${srcY} C ${loopX} ${srcY}, ${loopX} ${dstY}, ${dstX} ${dstY}`;
+      } else {
+        // Finish-to-start
+        dstX = dstStartX;
+        dstY = dstCenterY;
+
+        // S-curve: depart rightward from src, arrive from left into dst
+        const cp1x = srcX + 40;
+        const cp2x = Math.max(dstX - 40, srcX + 20);
+        d = `M ${srcX} ${srcY} C ${cp1x} ${srcY}, ${cp2x} ${dstY}, ${dstX} ${dstY}`;
+      }
+
+      arrows.push(
+        <path
+          key={`${depId}->${ticket.id}`}
+          d={d}
+          fill="none"
+          stroke="#94A3B8"
+          strokeWidth={1.5}
+          strokeDasharray="4 2"
+          markerEnd="url(#arrow-normal)"
+          className="dep-arrow"
+          opacity={0.8}
+        />
+      );
+  });
+
+  return <g>{arrows}</g>;
+}
+
+// ============================================================
+// === SECTION: DeadlineLine ===
+// ============================================================
+function DeadlineLine({ hardEndDate, chartMinMs, pixelsPerDay, svgHeight }) {
+  if (!hardEndDate) return null;
+  const x = dateToX(parseDate(hardEndDate).getTime(), chartMinMs, pixelsPerDay);
+  return (
+    <g>
+      <line x1={x} y1={0} x2={x} y2={svgHeight} stroke="#EF4444" strokeWidth={2} strokeDasharray="6 3" />
+      <rect x={x - 36} y={4} width={72} height={18} rx={3} fill="#EF4444" />
+      <text x={x} y={17} textAnchor="middle" fontSize={10} fill="white" fontWeight="600">
+        DEADLINE
+      </text>
+    </g>
+  );
+}
+
+// ============================================================
+// === SECTION: ReleaseDateBanner ===
+// ============================================================
+function ReleaseDateBanner({ tickets, effDates, hardEndDate, sim }) {
+  if (!hardEndDate || tickets.length === 0) return null;
+
+  const hardEndMs = parseDate(hardEndDate).getTime();
+  let latestEnd = 0;
+  tickets.forEach(t => {
+    const e = effDates[t.id];
+    if (e && e.end > latestEnd) latestEnd = e.end;
+  });
+
+  const todayMs = new Date().setHours(0, 0, 0, 0);
+  const deadlinePassed = todayMs > hardEndMs;
+  const slipDays = Math.ceil((latestEnd - hardEndMs) / MS_PER_DAY);
+  const isLate = slipDays > 0 || deadlinePassed;
+  const effectiveSlipDays = deadlinePassed && slipDays <= 0
+    ? Math.ceil((todayMs - hardEndMs) / MS_PER_DAY)
+    : slipDays;
+  const newReleaseDate = formatDate(latestEnd);
+  const hasDeltas = Object.keys(sim.deltas).length > 0;
+
+  if (!hasDeltas && !deadlinePassed) return null; // show when sim active OR deadline already passed
+
+  return (
+    <div className={`flex items-center gap-4 px-5 py-2 text-sm font-medium border-b ${isLate ? 'bg-red-600 text-white border-red-700' : 'bg-green-600 text-white border-green-700'}`}>
+      <span className="text-xs uppercase tracking-widest font-semibold opacity-80">
+        {isLate ? (deadlinePassed && !hasDeltas ? '⚠ Deadline Passed' : '⚠ New Release Date') : '✓ Still On Track'}
+      </span>
+      <span className="text-xl font-bold tracking-tight">{deadlinePassed && !hasDeltas ? hardEndDate : newReleaseDate}</span>
+      {isLate && (
+        <span className="text-xs opacity-80 font-normal">
+          ({effectiveSlipDays} day{effectiveSlipDays !== 1 ? 's' : ''} past deadline of {hardEndDate})
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// === SECTION: ImpactSummary ===
+// ============================================================
+function ImpactSummary({ tickets, teams, effDates, criticalIds, hardEndDate, sim, dispatch }) {
+  if (!hardEndDate || tickets.length === 0) return null;
+
+  const hardEndMs = parseDate(hardEndDate).getTime();
+  let latestEnd = 0;
+  tickets.forEach(t => {
+    const e = effDates[t.id];
+    if (e && e.end > latestEnd) latestEnd = e.end;
+  });
+
+  const todayMs = new Date().setHours(0, 0, 0, 0);
+  const deadlinePassed = todayMs > hardEndMs;
+  const slipDays = Math.ceil((latestEnd - hardEndMs) / MS_PER_DAY);
+  const isLate = slipDays > 0 || deadlinePassed;
+  const displaySlipDays = deadlinePassed && slipDays <= 0
+    ? Math.ceil((todayMs - hardEndMs) / MS_PER_DAY)
+    : slipDays;
+
+  const teamById = {};
+  teams.forEach(t => { teamById[t.id] = t; });
+
+
+  return (
+    <div className="border-t border-gray-200 bg-white flex flex-col flex-shrink-0" style={{ maxHeight: '45vh' }}>
+      <div className="px-4 pt-3 pb-1 flex items-center gap-3 flex-shrink-0 flex-wrap">
+        <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider flex-shrink-0">
+          Simulate Delay per Ticket
+        </span>
+
+        {Object.keys(sim.deltas).length > 0 && (
+          <button
+            onClick={() => dispatch({ type: 'RESET_SIM' })}
+            className="text-xs text-red-400 hover:text-red-600 font-normal border border-red-200 rounded px-1.5 py-0.5 flex-shrink-0"
+          >Reset all</button>
+        )}
+
+        {/* Legend — pushed to the right */}
+        <div className="ml-auto flex items-center flex-wrap gap-x-3 gap-y-1 text-xs text-gray-400 flex-shrink-0">
+          <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2 rounded" style={{ background: '#EF4444' }} />Critical</span>
+          <span className="flex items-center gap-1"><span className="inline-block w-2.5 h-2 rounded" style={{ background: '#F97316' }} />Past deadline</span>
+          <span className="flex items-center gap-1"><span className="inline-block w-5 border-t border-dashed border-gray-400" />Dep.</span>
+          <span className="flex items-center gap-1"><span className="inline-block border-l-2 border-dashed border-red-400 h-3 mx-0.5" />Deadline</span>
+          <span className="flex items-center gap-1"><span className="inline-block w-5 h-2 rounded border border-dashed" style={{ background: 'rgba(79,134,198,0.2)' }} />Baseline</span>
+        </div>
+      </div>
+
+      {/* Scrollable slider list */}
+      <div className="overflow-y-auto flex-1 min-h-0 px-4 pb-3">
+        <div className="space-y-1.5 pt-1" style={{ minWidth: 360 }}>
+          {tickets.map(ticket => {
+            const team = teamById[ticket.teamId];
+            const delta = sim.deltas[ticket.id] ?? 0;
+            const eff = effDates[ticket.id];
+            const isCritical = criticalIds.has(ticket.id);
+            const baseStartMs = parseDate(ticket.startDate).getTime();
+            const cascadedSlip = eff ? Math.round((eff.start - baseStartMs) / MS_PER_DAY) : 0;
+
+            return (
+              <div key={ticket.id} className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: team?.color || '#ccc' }} />
+                <span className={`text-xs w-28 truncate flex-shrink-0 ${isCritical ? 'text-red-600 font-semibold' : 'text-gray-600'}`}
+                  title={ticket.name}>
+                  {ticket.name}
+                </span>
+                <input
+                  type="range"
+                  min={0} max={30} step={1}
+                  value={delta}
+                  onChange={e => dispatch({ type: 'SET_DELTA', payload: { ticketId: ticket.id, delta: Number(e.target.value) } })}
+                  className="flex-1"
+                  style={{ accentColor: team?.color || '#3B82F6' }}
+                />
+                <span className={`text-xs w-10 text-right flex-shrink-0 font-mono ${delta > 0 ? 'text-red-500 font-bold' : 'text-gray-300'}`}>
+                  {delta > 0 ? `+${delta}d` : '0d'}
+                </span>
+                {cascadedSlip > delta && (
+                  <span className="text-xs text-orange-400 flex-shrink-0" title={`Cascaded ${cascadedSlip - delta}d from upstream`}>
+                    ↝{cascadedSlip}d
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// === SECTION: GanttChart ===
+// ============================================================
+function GanttChart({ state, dispatch }) {
+  const { requirement, teams, tickets, sim } = state;
+  const containerRef = useRef(null);
+  const [containerWidth, setContainerWidth] = useState(900);
+  const [activeDragId, setActiveDragId] = useState(null);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const ro = new ResizeObserver(entries => {
+      for (const entry of entries) {
+        setContainerWidth(entry.contentRect.width);
+      }
+    });
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  const noEndDateTickets = tickets.filter(t => t.name && !t.endDate);
+  const hasIncomplete = noEndDateTickets.length > 0;
+
+  // Only include tickets with both start and end date in Gantt computation
+  const validTickets = tickets.filter(t => t.startDate && t.endDate && t.name);
+
+  const { effDates, hasCycle, cycleIds } = computeEffectiveDates(validTickets, sim.deltas);
+  const hardEndMs = requirement.hardEndDate ? parseDate(requirement.hardEndDate).getTime() : 0;
+
+  const { minMs, maxMs } = computeChartRange(validTickets, effDates, requirement.hardEndDate || formatDate(Date.now()), CHART_PADDING);
+  const totalDays = Math.max(1, (maxMs - minMs) / MS_PER_DAY);
+  const chartContentWidth = Math.max(containerWidth - LABEL_WIDTH, 600);
+  const pixelsPerDay = chartContentWidth / totalDays;
+  const svgWidth = Math.max(containerWidth, LABEL_WIDTH + totalDays * pixelsPerDay);
+  const { criticalIds, criticalEdges } = hardEndMs
+    ? computeCriticalPath(validTickets, effDates, requirement.hardEndDate)
+    : { criticalIds: new Set(), criticalEdges: new Set() };
+
+  // Per-team sub-row layout (greedy interval packing to avoid bar overlap)
+  const teamSubRows = {};   // { teamId: { [ticketId]: subRowIndex } }
+  const teamNumRows = {};   // { teamId: number }
+  teams.forEach(team => {
+    const teamTickets = validTickets.filter(t => t.teamId === team.id);
+    const sr = assignSubRows(teamTickets, effDates);
+    teamSubRows[team.id] = sr;
+    const maxRow = teamTickets.reduce((m, t) => Math.max(m, sr[t.id] ?? 0), 0);
+    teamNumRows[team.id] = Math.max(1, maxRow + 1);
+  });
+
+  // Compute cumulative laneTop offsets for each team
+  const teamLaneTops = {};
+  let runningTop = AXIS_HEIGHT;
+  teams.forEach(team => {
+    teamLaneTops[team.id] = runningTop;
+    runningTop += teamNumRows[team.id] * LANE_HEIGHT;
+  });
+  const svgHeight = runningTop + 2;
+
+  // Map each ticket to its bar vertical center (for dependency arrows)
+  const ticketBarCenterY = {};
+  validTickets.forEach(ticket => {
+    const laneTop = teamLaneTops[ticket.teamId] ?? AXIS_HEIGHT;
+    const subRow = teamSubRows[ticket.teamId]?.[ticket.id] ?? 0;
+    ticketBarCenterY[ticket.id] = laneTop + subRow * LANE_HEIGHT + LANE_HEIGHT / 2;
+  });
+
+  const teamById = {};
+  teams.forEach(t => { teamById[t.id] = t; });
+
+  // Delivery status for top bar badge
+  const todayMs = new Date().setHours(0, 0, 0, 0);
+  const deadlinePassed = hardEndMs > 0 && todayMs > hardEndMs;
+  let latestEndMs = 0;
+  validTickets.forEach(t => { const e = effDates[t.id]; if (e && e.end > latestEndMs) latestEndMs = e.end; });
+  const slipDays = hardEndMs > 0 ? Math.ceil((latestEndMs - hardEndMs) / MS_PER_DAY) : 0;
+  const isLate = slipDays > 0 || deadlinePassed;
+  const displaySlip = deadlinePassed && slipDays <= 0
+    ? Math.ceil((todayMs - hardEndMs) / MS_PER_DAY)
+    : slipDays;
+
+  return (
+    <div className="flex flex-col flex-1 min-w-0">
+      {/* Top bar */}
+      <div className="border-b border-gray-200 bg-white px-4 py-2 flex items-center justify-between flex-shrink-0">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => dispatch({ type: 'SET_VIEW', payload: 'setup' })}
+            className="text-xs text-blue-600 hover:text-blue-800"
+          >← Setup</button>
+          <span className="text-gray-300">|</span>
+          <h2 className="text-sm font-semibold text-gray-800">{requirement.name || 'Untitled'}</h2>
+          {requirement.hardEndDate && (
+            <span className="text-xs text-gray-400">deadline: {requirement.hardEndDate}</span>
+          )}
+          {validTickets.length > 0 && hardEndMs > 0 && (
+            <span className={`ml-1 px-2.5 py-0.5 rounded-full text-xs font-bold tracking-wide ${isLate ? 'bg-red-100 text-red-700 border border-red-300' : 'bg-green-100 text-green-700 border border-green-300'}`}>
+              {isLate ? `⚠ ${displaySlip}d late` : '✓ On track'}
+            </span>
+          )}
+        </div>
+        <span className="text-xs text-gray-400">Drag bars or use sliders below to simulate slips</span>
+      </div>
+
+      {/* Incomplete tickets warning — blocks delivery estimate */}
+      {hasIncomplete && (
+        <div className="bg-amber-50 border-b border-amber-200 px-4 py-2.5 text-sm text-amber-800 flex items-start gap-2 flex-shrink-0">
+          <span className="mt-0.5">⚠</span>
+          <div>
+            <span className="font-semibold">Deadline cannot be committed</span>
+            {' — '}the following ticket{noEndDateTickets.length > 1 ? 's have' : ' has'} no planned end date:{' '}
+            <span className="font-medium">{noEndDateTickets.map(t => t.name).join(', ')}</span>.
+            {' '}Delivery estimate and critical path are hidden until all tickets have end dates.
+          </div>
+        </div>
+      )}
+
+      {/* Release date banner — appears only when simulation is active */}
+      {!hasIncomplete && (
+        <ReleaseDateBanner
+          tickets={validTickets}
+          effDates={effDates}
+          hardEndDate={requirement.hardEndDate}
+          sim={sim}
+        />
+      )}
+
+      {/* Cycle error */}
+      {hasCycle && (
+        <div className="bg-red-50 border-b border-red-200 px-4 py-2 text-xs text-red-700">
+          ⚠ Dependency cycle detected in: {cycleIds.join(', ')}. Please check ticket dependencies.
+        </div>
+      )}
+
+      {/* SVG Gantt */}
+      <div ref={containerRef} className="gantt-scroll flex-1 min-h-0">
+        <svg
+          width={svgWidth}
+          height={svgHeight}
+          style={{ display: 'block', fontFamily: 'inherit' }}
+        >
+          <defs>
+            <marker id="arrow-normal" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L8,3 Z" fill="#94A3B8" />
+            </marker>
+            <marker id="arrow-critical" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L8,3 Z" fill="#EF4444" />
+            </marker>
+            <marker id="arrow-finish" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L8,3 Z" fill="#3B82F6" />
+            </marker>
+          </defs>
+
+          {/* Swimlanes */}
+          {teams.map((team, teamIndex) => {
+            const teamTickets = validTickets.filter(t => t.teamId === team.id);
+            return (
+              <SwimLane
+                key={team.id}
+                team={team}
+                isEven={teamIndex % 2 === 0}
+                laneTop={teamLaneTops[team.id]}
+                laneHeight={teamNumRows[team.id] * LANE_HEIGHT}
+                tickets={teamTickets}
+                subRows={teamSubRows[team.id] ?? {}}
+                effDates={effDates}
+                criticalIds={criticalIds}
+                hardEndMs={hardEndMs}
+                deltas={sim.deltas}
+                dispatch={dispatch}
+                pixelsPerDay={pixelsPerDay}
+                chartMinMs={minMs}
+                svgWidth={svgWidth}
+                activeDragId={activeDragId}
+              />
+            );
+          })}
+
+          {/* Date axis (on top of lanes) */}
+          <DateAxis
+            chartMinMs={minMs}
+            chartMaxMs={maxMs}
+            pixelsPerDay={pixelsPerDay}
+            svgWidth={svgWidth}
+          />
+
+          {/* Dependency arrows */}
+          <DependencyArrows
+            tickets={validTickets}
+            teams={teams}
+            effDates={effDates}
+            criticalEdges={criticalEdges}
+            pixelsPerDay={pixelsPerDay}
+            chartMinMs={minMs}
+            ticketBarCenterY={ticketBarCenterY}
+          />
+
+          {/* Hard deadline line */}
+          {hardEndMs > 0 && (
+            <DeadlineLine
+              hardEndDate={requirement.hardEndDate}
+              chartMinMs={minMs}
+              pixelsPerDay={pixelsPerDay}
+              svgHeight={svgHeight}
+            />
+          )}
+        </svg>
+      </div>
+
+      {/* Impact summary + slider table — only when all tickets have end dates */}
+      {!hasIncomplete && (
+        <ImpactSummary
+          tickets={validTickets}
+          teams={teams}
+          effDates={effDates}
+          criticalIds={criticalIds}
+          hardEndDate={requirement.hardEndDate}
+          sim={sim}
+          dispatch={dispatch}
+        />
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// === SECTION: App ===
+// ============================================================
+function loadInitialState() {
+  try {
+    const raw = localStorage.getItem('drv_appstate_v1');
+    if (raw) return { ...DEFAULT_STATE, ...JSON.parse(raw) };
+  } catch (e) {}
+  return DEFAULT_STATE;
+}
+
+function App() {
+  const [state, dispatch] = useReducer(appReducer, null, loadInitialState);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('drv_appstate_v1', JSON.stringify(state));
+    } catch (e) {}
+  }, [state]);
+
+  return (
+    <div className="flex h-screen w-screen overflow-hidden">
+      {state.activeView === 'setup' ? (
+        <>
+          <div className="flex-shrink-0 h-screen" style={{ width: 300 }}>
+            <SetupPanel state={state} dispatch={dispatch} />
+          </div>
+          <div className="flex-1 flex items-center justify-center bg-gray-50">
+            <div className="text-center text-gray-400">
+              <div className="text-5xl mb-4">📊</div>
+              <div className="text-lg font-medium text-gray-500 mb-1">Delivery Risk Visualizer</div>
+              <div className="text-sm">Add your requirement, teams, and tickets,</div>
+              <div className="text-sm">then click <strong>View Gantt →</strong> to start simulating delays.</div>
+              <button
+                className="mt-6 text-xs border border-gray-300 rounded px-3 py-1.5 hover:bg-white text-gray-500"
+                onClick={() => dispatch({ type: 'LOAD_STATE', payload: SAMPLE_PLAN })}
+              >Load sample plan</button>
+            </div>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="flex-shrink-0 h-screen" style={{ width: 300 }}>
+            <SetupPanel state={state} dispatch={dispatch} />
+          </div>
+          <GanttChart state={state} dispatch={dispatch} />
+        </>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
