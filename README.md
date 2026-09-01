@@ -4,6 +4,12 @@ A zero-install, browser-based Gantt chart tool for engineering delivery planning
 
 ---
 
+## Live Demo
+
+Try it now: **https://viv1ag.github.io/delivery-risk-visualizer/**
+
+---
+
 ## Quick Start
 
 1. Download `index.html` from this repo (click the file → **Raw** → Save As)
