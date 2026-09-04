@@ -106,8 +106,9 @@ function normDateMs(ms) {
 }
 
 function addDays(dateStr, days) {
-  const ms = parseDate(dateStr).getTime() + days * MS_PER_DAY;
-  return formatDate(ms);
+  const d = parseDate(dateStr);
+  d.setDate(d.getDate() + days);
+  return formatDate(d.getTime());
 }
 
 function diffDays(dateStrA, dateStrB) {
