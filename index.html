@@ -432,6 +432,27 @@ function SetupPanel({ state, dispatch }) {
     setNewTicket({ name: '', teamIds: newTicket.teamIds, startDate: newTicket.endDate || newTicket.startDate, endDate: '', dependsOn: [] });
   }
 
+  function handleExportHtml() {
+    const src = document.documentElement.outerHTML;
+    const marker = '/* __EMBEDDED_STATE__ */';
+    const injection = `/* __EMBEDDED_STATE__ */\nwindow.__EMBEDDED_STATE__ = ${JSON.stringify(state)};\n`;
+    let out;
+    if (src.includes(marker)) {
+      // Replace existing embedded state
+      out = src.replace(/\/\* __EMBEDDED_STATE__ \*\/[\s\S]*?;\n/, injection);
+    } else {
+      // Inject just before the closing </script> tag
+      out = src.replace('ReactDOM.createRoot', injection + 'ReactDOM.createRoot');
+    }
+    const blob = new Blob([out], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${requirement.name || 'plan'}.html`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   function handleSaveJson() {
     const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -642,6 +663,7 @@ function SetupPanel({ state, dispatch }) {
             <button onClick={() => fileInputRef.current?.click()} className="flex-1 text-xs border border-gray-300 rounded py-1.5 hover:bg-gray-50">↑ Load JSON</button>
             <input ref={fileInputRef} type="file" accept=".json" className="hidden" onChange={handleLoadJson} />
           </div>
+          <button onClick={handleExportHtml} className="w-full mt-2 text-xs bg-blue-50 border border-blue-300 text-blue-700 rounded py-1.5 hover:bg-blue-100">⬇ Export as HTML</button>
           <button
             onClick={() => {
               if (window.confirm('Reset everything to a blank state? This cannot be undone.')) {
@@ -1471,6 +1493,7 @@ function GanttChart({ state, dispatch }) {
 // === SECTION: App ===
 // ============================================================
 function loadInitialState() {
+  if (window.__EMBEDDED_STATE__) return { ...DEFAULT_STATE, ...window.__EMBEDDED_STATE__ };
   try {
     const raw = localStorage.getItem('drv_appstate_v1');
     if (raw) return { ...DEFAULT_STATE, ...JSON.parse(raw) };
