@@ -52,8 +52,15 @@ Tickets are the units of work (think Jira stories or tasks).
    - **Name** - short label shown on the Gantt bar (e.g. "API Auth")
    - **Team** - which swimlane this ticket belongs to
    - **Start Date** and **End Date** - the baseline planned dates
-   - **Depends On** - select upstream tickets that must finish before this one starts (multi-select)
+   - **Depends On** - select upstream tickets and choose dependency type (see below)
 3. Repeat for all tickets in the plan
+
+#### Dependency Types
+
+| Type | Meaning | When to use |
+|---|---|---|
+| **Blocks start** | Upstream must finish before this ticket can **start** | Most common — e.g. "INFRA setup must finish before API work can begin" |
+| **Blocks finish** | Upstream must finish before this ticket can **finish** (start is free) | e.g. "Code review must finish before QA sign-off can close" |
 
 > **Tip:** Dates drive the Gantt bar position. Set realistic baseline dates - you'll simulate slippage separately.
 
@@ -65,8 +72,8 @@ Click the **Gantt** tab in the top navigation.
 
 You will see:
 - **Swimlanes** - one horizontal row per team
-- **Bars** - each ticket shown as a colored bar spanning its start-to-end dates
-- **Dashed grey arrows** - dependency connections between tickets
+- **Bars** - each ticket shown as a colored bar spanning its start-to-end dates; bars automatically widen to always show the full ticket name
+- **Dashed grey arrows** - dependency connections between tickets, departing from the right edge of the upstream bar and arriving at the left edge of the downstream bar
 - **Dashed red vertical line** - your hard deadline
 - **Status badge** in the top bar - shows **✓ On track** (green) or **⚠ N days late** (red) at a glance
 
@@ -104,14 +111,26 @@ The **bottom panel** ("Simulate Delay per Ticket") gives you precise numeric con
 | **Red bar** | Ticket is on the critical path - any further delay directly pushes the deadline |
 | **Orange/amber bar** | Ticket's effective end date has passed the hard deadline |
 | **Team color bar** | Normal - ticket has float and is not blocking delivery |
-| **Dashed grey arrow** | Dependency: the downstream ticket cannot start until the upstream one finishes |
+| **Faded ghost bar** | Original baseline position (shown when a ticket has been delayed) |
+| **Dashed grey arrow** | Dependency: downstream ticket cannot start (or finish) until upstream finishes |
 | **Dashed red vertical line** | Hard deadline |
-| **⚠ N days late** badge | Latest ticket end is N days beyond the hard deadline |
-| **✓ On track** badge | All tickets finish on or before the hard deadline |
+| **⚠ N days late badge** | Latest ticket end is N days beyond the hard deadline |
+| **✓ On track badge** | All tickets finish on or before the hard deadline |
 
 ---
 
-### Step 8 - Save and Share Your Plan
+### Step 8 - Export a Snapshot
+
+Click **⬇ Export as PNG** in the Gantt top bar to save a point-in-time image of the plan.
+
+- The PNG includes the plan title, deadline, status badge, release banner (if applicable), and the full Gantt chart
+- Filename format: `<requirement name>_snapshot_<YYYYMMDD_HHMMSS>.png`
+- Exported at 2× resolution for crisp display on retina screens
+- No data leaves your machine — the image is generated entirely in the browser
+
+---
+
+### Step 9 - Save and Share Your Plan
 
 #### Save to JSON
 Click **Save JSON** - downloads a `.json` file with your full plan (requirement, teams, tickets, and current simulation state).
@@ -129,7 +148,7 @@ The tool auto-saves to your browser's `localStorage` every time you make a chang
 
 ---
 
-### Step 9 - Share with Stakeholders
+### Step 10 - Share with Stakeholders
 
 Since the entire app is a single HTML file, sharing is simple:
 
@@ -137,6 +156,7 @@ Since the entire app is a single HTML file, sharing is simple:
 - **Email / Teams / Slack** - attach `index.html` directly; recipients open it in their browser with no installation
 - **Shared drive** - drop it in a OneDrive / SharePoint folder; anyone with the link can open and use it
 - **JSON plan files** - share `.json` plan files alongside `index.html` so teammates can load the same plan
+- **PNG snapshot** - export and share a read-only image for async reviews or status updates
 
 ---
 
@@ -146,11 +166,13 @@ Since the entire app is a single HTML file, sharing is simple:
 |---|---|
 | Zero install | Single HTML file, open in any modern browser |
 | Multi-team swimlanes | One row per team, color-coded |
-| Dependency graph | Tickets depend on one or more upstream tickets |
+| Dependency graph | Blocks-start and blocks-finish dependency types |
+| Smart bar sizing | Bars auto-expand to always show the full ticket name |
 | Cascading simulation | Drag to delay - all downstream dates auto-recalculate |
 | Critical path | Computed automatically; critical tickets shown in red |
 | Hard deadline tracking | Fixed red line + live "on track / N days late" badge |
 | Delay sliders | Precise per-ticket delay control (0–30 days) |
+| Export as PNG | One-click snapshot at 2× resolution with title, badge, and Gantt |
 | Save / Load JSON | Full plan persistence, browser-side only |
 | Auto-save | Saves to localStorage on every change |
 | No server needed | Fully offline capable after first load |

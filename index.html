@@ -8,6 +8,7 @@
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
   <style>
     * { box-sizing: border-box; }
     body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
@@ -434,24 +435,8 @@ function SetupPanel({ state, dispatch }) {
   }
 
   function handleExportHtml() {
-    const src = document.documentElement.outerHTML;
-    const marker = '/* __EMBEDDED_STATE__ */';
-    const injection = `/* __EMBEDDED_STATE__ */\nwindow.__EMBEDDED_STATE__ = ${JSON.stringify(state)};\n`;
-    let out;
-    if (src.includes(marker)) {
-      // Replace existing embedded state
-      out = src.replace(/\/\* __EMBEDDED_STATE__ \*\/[\s\S]*?;\n/, injection);
-    } else {
-      // Inject just before the closing </script> tag
-      out = src.replace('ReactDOM.createRoot', injection + 'ReactDOM.createRoot');
-    }
-    const blob = new Blob([out], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${requirement.name || 'plan'}.html`;
-    a.click();
-    URL.revokeObjectURL(url);
+    window.__CURRENT_TITLE__ = requirement.name || 'plan';
+    window.__doExportPng();
   }
 
   function handleSaveJson() {
@@ -664,7 +649,6 @@ function SetupPanel({ state, dispatch }) {
             <button onClick={() => fileInputRef.current?.click()} className="flex-1 text-xs border border-gray-300 rounded py-1.5 hover:bg-gray-50">↑ Load JSON</button>
             <input ref={fileInputRef} type="file" accept=".json" className="hidden" onChange={handleLoadJson} />
           </div>
-          <button onClick={handleExportHtml} className="w-full mt-2 text-xs bg-blue-50 border border-blue-300 text-blue-700 rounded py-1.5 hover:bg-blue-100">⬇ Export as HTML</button>
           <button
             onClick={() => {
               if (window.confirm('Reset everything to a blank state? This cannot be undone.')) {
@@ -855,7 +839,10 @@ function DateAxis({ chartMinMs, chartMaxMs, pixelsPerDay, svgWidth }) {
 // ============================================================
 function TicketBar({ ticket, effStart, effEnd, baseStart, baseEnd, laneTop, isCritical, isPastDeadline, isDragging, isDragged, teamColor, dispatch, pixelsPerDay, chartMinMs }) {
   const x = dateToX(effStart, chartMinMs, pixelsPerDay);
-  const w = Math.max(4, dateToX(effEnd, chartMinMs, pixelsPerDay) - x);
+  const wDate = Math.max(4, dateToX(effEnd, chartMinMs, pixelsPerDay) - x);
+  const label = ticket.name + (isDragged ? ` +${isDragged}d` : '');
+  const minTextW = label.length * 7 + 16;
+  const w = Math.max(wDate, minTextW); // expand bar to fit label — arrows use wDate, not w
   const y = laneTop + (LANE_HEIGHT - BAR_HEIGHT) / 2;
 
   // Ghost bar geometry (baseline position)
@@ -934,18 +921,15 @@ function TicketBar({ ticket, effStart, effEnd, baseStart, baseEnd, laneTop, isCr
           strokeWidth={1}
           opacity={isDragging ? 0.7 : 1}
         />
-        {w > 20 && (
-          <text
-            x={x + 6} y={y + BAR_HEIGHT / 2 + 4}
-            textAnchor="start"
-            fontSize={w < 80 ? 9 : w < 130 ? 10 : 11}
-            fill="white" fontWeight="500"
-            style={{ pointerEvents: 'none', userSelect: 'none' }}
-            clipPath={`url(#clip-bar-${ticket.id})`}
-          >
-            {ticket.name}{isDragged ? ` +${isDragged}d` : ''}
-          </text>
-        )}
+        <text
+          x={x + w / 2} y={y + BAR_HEIGHT / 2 + 4}
+          textAnchor="middle"
+          fontSize={w < 80 ? 9 : w < 130 ? 10 : 11}
+          fill="white" fontWeight="500"
+          style={{ pointerEvents: 'none', userSelect: 'none' }}
+        >
+          {label}
+        </text>
         <title>{tooltipLines}</title>
       </g>
     </g>
@@ -1041,7 +1025,7 @@ function SwimLane({ team, isEven, laneTop, laneHeight, tickets, subRows, effDate
 // ============================================================
 // === SECTION: DependencyArrows ===
 // ============================================================
-function DependencyArrows({ tickets, effDates, criticalEdges, pixelsPerDay, chartMinMs, ticketBarCenterY }) {
+function DependencyArrows({ tickets, effDates, criticalEdges, pixelsPerDay, chartMinMs, ticketBarCenterY, deltas }) {
   if (!tickets || !ticketBarCenterY) return <g/>;
 
   // Pre-collect all edges so we can fan out multiple arrows from the same source
@@ -1068,9 +1052,22 @@ function DependencyArrows({ tickets, effDates, criticalEdges, pixelsPerDay, char
       const dstCenterY = ticketBarCenterY[ticket.id] ?? 0;
       const BAR_HALF = BAR_HEIGHT / 2;
 
-      const srcX = dateToX(upEff.end, chartMinMs, pixelsPerDay);
-      const dstEndX = dateToX(downEff.end, chartMinMs, pixelsPerDay);
-      const dstStartX = dateToX(downEff.start, chartMinMs, pixelsPerDay);
+      // Mirror TicketBar's visual width: Math.max(dateWidth, labelWidth)
+      // Label includes drag suffix "+Nd" just like TicketBar does
+      const upDelta   = (deltas && deltas[upstream.id]) || 0;
+      const upLabel   = upstream.name + (upDelta ? ` +${upDelta}d` : '');
+      const upVisX    = dateToX(upEff.start, chartMinMs, pixelsPerDay);
+      const upDateW   = Math.max(4, dateToX(upEff.end, chartMinMs, pixelsPerDay) - upVisX);
+      const upVisW    = Math.max(upDateW, upLabel.length * 7 + 16);
+      const srcX      = upVisX + upVisW; // visual right edge of upstream bar
+
+      const downDelta  = (deltas && deltas[ticket.id]) || 0;
+      const downLabel  = ticket.name + (downDelta ? ` +${downDelta}d` : '');
+      const downVisX   = dateToX(downEff.start, chartMinMs, pixelsPerDay);
+      const downDateW  = Math.max(4, dateToX(downEff.end, chartMinMs, pixelsPerDay) - downVisX);
+      const downVisW   = Math.max(downDateW, downLabel.length * 7 + 16);
+      const dstStartX  = downVisX;             // visual left edge of downstream bar
+      const dstEndX    = downVisX + downVisW;  // visual right edge of downstream bar
 
       // Fan-out: spread departure Y across the bar height when multiple arrows leave same source
       const count = srcCount[depId] || 1;
@@ -1093,10 +1090,19 @@ function DependencyArrows({ tickets, effDates, criticalEdges, pixelsPerDay, char
         dstX = dstStartX;
         dstY = dstCenterY;
 
-        // S-curve: depart rightward from src, arrive from left into dst
-        const cp1x = srcX + 40;
-        const cp2x = Math.max(dstX - 40, srcX + 20);
-        d = `M ${srcX} ${srcY} C ${cp1x} ${srcY}, ${cp2x} ${dstY}, ${dstX} ${dstY}`;
+        const gap = dstX - srcX;
+        if (gap >= 40) {
+          // Enough horizontal room — smooth S-curve, always arrives left→right
+          const bend = Math.min(gap * 0.45, 60);
+          d = `M ${srcX} ${srcY} C ${srcX + bend} ${srcY}, ${dstX - bend} ${dstY}, ${dstX} ${dstY}`;
+        } else {
+          // Adjacent/overlapping — arc through a midpoint between the lanes
+          // so arrow departs right and arrives from left without ugly elbows
+          const midY = (srcY + dstY) / 2;
+          const bulge = 40 + Math.abs(dstY - srcY) * 0.3;
+          const midX = Math.max(srcX, dstX) + bulge;
+          d = `M ${srcX} ${srcY} C ${midX} ${srcY}, ${midX} ${dstY}, ${dstX} ${dstY}`;
+        }
       }
 
       arrows.push(
@@ -1365,6 +1371,10 @@ function GanttChart({ state, dispatch }) {
               {isLate ? `⚠ ${displaySlip}d late` : '✓ On track'}
             </span>
           )}
+          <button
+            onClick={() => { window.__CURRENT_TITLE__ = requirement.name || 'plan'; window.__doExportPng(); }}
+            className="ml-2 px-2.5 py-0.5 text-xs bg-blue-50 border border-blue-300 text-blue-700 rounded-full hover:bg-blue-100"
+          >⬇ Export as PNG</button>
         </div>
         <span className="text-xs text-gray-400">Drag bars or use sliders below to simulate slips</span>
       </div>
@@ -1460,6 +1470,7 @@ function GanttChart({ state, dispatch }) {
             pixelsPerDay={pixelsPerDay}
             chartMinMs={minMs}
             ticketBarCenterY={ticketBarCenterY}
+            deltas={sim.deltas}
           />
 
           {/* Hard deadline line */}
@@ -1544,6 +1555,138 @@ function App() {
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+<script>
+window.__doExportPng = function() {
+  var title = window.__CURRENT_TITLE__ || 'plan';
+  var S = 2; // retina scale
+  var FONT = 'system-ui,-apple-system,"Segoe UI",sans-serif';
+
+  var root = document.getElementById('root');
+  var ganttCol = root.querySelector('.flex.flex-col.flex-1');
+  var svgEl = ganttCol ? ganttCol.querySelector('svg') : null;
+  if (!svgEl) { alert('Export: Gantt SVG not found'); return; }
+
+  // Read info we need BEFORE hiding anything
+  var topBar = root.querySelector('.border-b.border-gray-200.bg-white.px-4');
+  var releaseBanner = ganttCol.querySelector('.bg-red-600,.bg-green-600');
+  var deadlineSpan = topBar ? topBar.querySelector('.text-xs.text-gray-400') : null;
+  var badgeSpan = topBar ? topBar.querySelector('.rounded-full') : null;
+  var deadlineText = deadlineSpan ? deadlineSpan.textContent.trim() : '';
+  var badgeText = badgeSpan ? badgeSpan.textContent.trim() : '';
+  var badgeIsLate = badgeSpan ? badgeSpan.classList.contains('text-red-700') : false;
+  // Build banner text from individual spans to preserve spacing
+  var bannerParts = [];
+  var bannerIsLate = false;
+  var bannerH = 0;
+  if (releaseBanner) {
+    bannerIsLate = releaseBanner.classList.contains('bg-red-600');
+    releaseBanner.querySelectorAll('span').forEach(function(s) {
+      var t = s.textContent.trim();
+      if (t) bannerParts.push(t);
+    });
+    bannerH = 48;
+  }
+  var bannerText = bannerParts.join('  ');
+  var hdrH = 44;
+
+  // Serialize SVG — inline font-family on every text element so it renders correctly outside the DOM
+  var svgClone = svgEl.cloneNode(true);
+  svgClone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  svgClone.querySelectorAll('text').forEach(function(t) {
+    var computed = window.getComputedStyle(svgEl.querySelector('text') || t);
+    if (!t.getAttribute('font-family')) t.setAttribute('font-family', FONT);
+    if (!t.getAttribute('font-size')) t.setAttribute('font-size', t.getAttribute('font-size') || computed.fontSize || '11');
+    if (!t.getAttribute('fill')) t.setAttribute('fill', computed.fill || '#374151');
+  });
+  var svgW = svgEl.getBoundingClientRect().width;
+  var svgH = svgEl.getBoundingClientRect().height;
+  if (svgW > 0) svgClone.setAttribute('width', svgW);
+  if (svgH > 0) svgClone.setAttribute('height', svgH);
+  var svgStr = new XMLSerializer().serializeToString(svgClone);
+  var svgUrl = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgStr);
+
+  var svgNatW = svgEl.getBoundingClientRect().width || 800;
+  var svgNatH = svgEl.getBoundingClientRect().height || 400;
+
+  var img = new Image();
+  img.onload = function() {
+    var W = svgNatW * S;
+    var totalH = (hdrH + bannerH) * S + svgNatH * S;
+
+    var canvas = document.createElement('canvas');
+    canvas.width = W;
+    canvas.height = totalH;
+    var ctx = canvas.getContext('2d');
+    var y = 0;
+
+    // --- Header bar ---
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, y, W, hdrH * S);
+    ctx.strokeStyle = '#e5e7eb';
+    ctx.lineWidth = 1 * S;
+    ctx.beginPath(); ctx.moveTo(0, hdrH * S - 1); ctx.lineTo(W, hdrH * S - 1); ctx.stroke();
+
+    // Plan name (bold)
+    ctx.fillStyle = '#111827';
+    ctx.font = 'bold ' + (14 * S) + 'px ' + FONT;
+    ctx.fillText(title, 16 * S, 27 * S);
+
+    // Deadline text
+    if (deadlineText) {
+      var nameW = ctx.measureText(title).width;
+      ctx.fillStyle = '#9ca3af';
+      ctx.font = (12 * S) + 'px ' + FONT;
+      ctx.fillText(deadlineText, 16 * S + nameW + 10 * S, 27 * S);
+    }
+
+    // Status badge
+    if (badgeText) {
+      var badgeBg = badgeIsLate ? '#fee2e2' : '#dcfce7';
+      var badgeFg = badgeIsLate ? '#b91c1c' : '#15803d';
+      var bdX = W - 16 * S - 120 * S;
+      ctx.fillStyle = badgeBg;
+      ctx.beginPath();
+      ctx.roundRect(bdX, 12 * S, 110 * S, 20 * S, 10 * S);
+      ctx.fill();
+      ctx.fillStyle = badgeFg;
+      ctx.font = 'bold ' + (11 * S) + 'px ' + FONT;
+      ctx.textAlign = 'center';
+      ctx.fillText(badgeText, bdX + 55 * S, 26 * S);
+      ctx.textAlign = 'left';
+    }
+
+    y = hdrH * S;
+
+    // --- Release banner ---
+    if (bannerText) {
+      ctx.fillStyle = bannerIsLate ? '#dc2626' : '#16a34a';
+      ctx.fillRect(0, y, W, bannerH * S);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold ' + (13 * S) + 'px ' + FONT;
+      ctx.fillText(bannerText, 16 * S, y + 26 * S);
+      y += bannerH * S;
+    }
+
+    // --- Gantt SVG ---
+    ctx.drawImage(img, 0, y, svgNatW * S, svgNatH * S);
+
+    // Download
+    var now = new Date();
+    var pad = function(n) { return String(n).padStart(2, '0'); };
+    var ts = now.getFullYear() + pad(now.getMonth()+1) + pad(now.getDate()) + '_' + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+    var a = document.createElement('a');
+    a.download = title + '_snapshot_' + ts + '.png';
+    a.href = canvas.toDataURL('image/png');
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  img.onerror = function() { alert('Export failed: SVG could not be rendered'); };
+  img.src = svgUrl;
+};
 </script>
 </body>
 </html>
